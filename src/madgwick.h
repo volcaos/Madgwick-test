@@ -1,3 +1,7 @@
+
+float gyro_error_rs;
+float gyro_error_rss;
+
 void reset_quaternion();
 
 void read_quaternion( float *q );

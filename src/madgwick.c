@@ -1,10 +1,11 @@
 // Math library required for �esqrt�f
 #include <math.h>
 
-// System constants
+#include "madgwick.h"
+
 //#define deltat 0.01f // sampling period in seconds (shown as 1 ms)
-#define gyroMeasError 3.14159265358979 * (5.0f / 180.0f) // gyroscope measurement error in rad/s (shown as 5 deg/s)
-#define gyroMeasDrift 3.14159265358979 * (0.2f / 180.0f) // gyroscope measurement error in rad/s/s (shown as 0.2f deg/s/s)
+#define gyroMeasError 3.14159265358979 * (gyro_error_rs / 180.0f) // gyroscope measurement error in rad/s (shown as 5 deg/s)
+#define gyroMeasDrift 3.14159265358979 * (gyro_error_rss / 180.0f) // gyroscope measurement error in rad/s/s (shown as 0.2f deg/s/s)
 #define beta (sqrt(3.0f / 4.0f) * gyroMeasError) // compute beta
 #define zeta (sqrt(3.0f / 4.0f) * gyroMeasDrift) // compute zeta
 
@@ -15,7 +16,6 @@
 float SEq_1 = 1, SEq_2 = 0, SEq_3 = 0, SEq_4 = 0; // estimated orientation quaternion elements with initial conditions
 float b_x = 1, b_z = 0; // reference direction of flux in earth frame
 float w_bx = 0, w_by = 0, w_bz = 0; // estimate gyroscope biases error
-
 
 float invSqrt(float x);
 

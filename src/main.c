@@ -23,206 +23,228 @@
 #include "smart_config.h"
 #include "mpu9250.h"
 #include "madgwick.h"
+#include "nvs.h"
+
+#include "tcpip_adapter.h"
+#include "lwip/sockets.h"
+
 
 #define BLINK_GPIO GPIO_NUM_2
+#define NVS_NAME "storage"
 
-static const char *TAG = "MY1STAPP";
+static const char *TAG = "main";
 
 TaskHandle_t imu_task_handle = NULL;
 TaskHandle_t led_task_handle = NULL;
+TaskHandle_t udp_task_handle = NULL;
 bool enableDoFScan;
+bool useAHRS = false;
+SemaphoreHandle_t xBinSemaphore;
 
-/*
-static void uart_rx_task()
-{
-	static const char *RX_TASK_TAG = "UART_RX_TASK";
-	esp_log_level_set(RX_TASK_TAG,ESP_LOG_INFO);
-    uint8_t *rx_buf = (uint8_t*)malloc(RX_BUF_SIZE+1);
-    while(1){
-        const int rxBytes = uart_read_bytes(UART_NUM_0, rx_buf, RX_BUF_SIZE, 1000 / portTICK_RATE_MS);
-        if( rxBytes > 0 ) {
-            rx_buf[rxBytes] = 0;
-            ESP_LOGI(RX_TASK_TAG, "Read %d bytes: '%s'", rxBytes, rx_buf);
-            ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, rx_buf, rxBytes, ESP_LOG_INFO);
-        }
-    }
-    free(rx_buf);
-}
-*/
-#if 0
-void wifi_init_sta()
-{
-    s_wifi_event_group = xEventGroupCreate();
+#define HOST_IP_ADDR	"192.168.1.108"
+#define HOST_PORT		8080
 
-    tcpip_adapter_init();
-
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = EXAMPLE_ESP_WIFI_SSID,
-            .password = EXAMPLE_ESP_WIFI_PASS
-        },
-    };
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA) );
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
-    ESP_ERROR_CHECK(esp_wifi_start() );
-
-    ESP_LOGI(TAG, "wifi_init_sta finished.");
-
-    /* Waiting until either the connection is established (WIFI_CONNECTED_BIT) or connection failed for the maximum
-     * number of re-tries (WIFI_FAIL_BIT). The bits are set by event_handler() (see above) */
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
-            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-            pdFALSE,
-            pdFALSE,
-            portMAX_DELAY);
-
-    /* xEventGroupWaitBits() returns the bits before the call returned, hence we can test which event actually
-     * happened. */
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "connected to ap SSID:%s password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "Failed to connect to SSID:%s, password:%s",
-                 EXAMPLE_ESP_WIFI_SSID, EXAMPLE_ESP_WIFI_PASS);
-    } else {
-        ESP_LOGE(TAG, "UNEXPECTED EVENT");
-    }
-
-    ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler));
-    ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler));
-    vEventGroupDelete(s_wifi_event_group);
-}
-#endif
+static char udp_buf[128];
 
 static void led_task()
 {
-    uint64_t t0=0, t1;
-    bool blink = false;
-    //
-    gpio_pad_select_gpio(BLINK_GPIO);
-    gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
-    //
-    while(1){
-        t1 = xTaskGetTickCount() / portTICK_PERIOD_MS;
-        if( !blink && t1-t0 >= 950 ){
-            t0 = t1;
-            blink = true;
-        }else if( blink && t1-t0 >= 50 ){
-            t0 = t1;
-            blink = false;
-        }
-        gpio_set_level(BLINK_GPIO,blink);
-        vTaskDelay(1/portTICK_PERIOD_MS);
-    }
-    gpio_set_level(BLINK_GPIO,false);
+	uint64_t t0=0, t1;
+	bool blink = false;
+	//
+	gpio_pad_select_gpio(BLINK_GPIO);
+	gpio_set_direction(BLINK_GPIO, GPIO_MODE_OUTPUT);
+	//
+	while(1){
+		t1 = xTaskGetTickCount() / portTICK_PERIOD_MS;
+		if( !blink && t1-t0 >= 950 ){
+			t0 = t1;
+			blink = true;
+		}else if( blink && t1-t0 >= 50 ){
+			t0 = t1;
+			blink = false;
+		}
+		gpio_set_level(BLINK_GPIO,blink);
+		vTaskDelay(1/portTICK_PERIOD_MS);
+	}
+	gpio_set_level(BLINK_GPIO,false);
 }
 
 
 
+
+static void udp_task()
+{
+    char rx_buffer[128];
+    char addr_str[128];
+    int addr_family;
+    int ip_protocol;
+	//
+	struct sockaddr_in dest_addr;
+	dest_addr.sin_addr.s_addr = inet_addr(HOST_IP_ADDR);
+	dest_addr.sin_family = AF_INET;
+	dest_addr.sin_port = htons(HOST_PORT);
+	addr_family = AF_INET;
+	ip_protocol = IPPROTO_IP;
+	inet_ntoa_r(dest_addr.sin_addr, addr_str, sizeof(addr_str) - 1);
+	// 
+	int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
+	if( sock < 0 ){
+		ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+	}
+	ESP_LOGI(TAG, "Socket created, sending to %s:%d", HOST_IP_ADDR, HOST_PORT);
+	// 
+    while(1){
+		float q[4];
+		if( xSemaphoreTake(xBinSemaphore,0) != pdTRUE ){
+			vTaskDelay(1);
+			continue;
+		}
+		read_quaternion(q);
+		int err = 0;
+		sprintf((char*)udp_buf,"%.6f,%.6f,%.6f,%.6f\n",q[0],q[1],q[2],q[3]);
+		err = sendto(sock, udp_buf, strlen(udp_buf), 0, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+		if( err < 0 ){
+			ESP_LOGE(TAG, "Error occurred during sending: errno %d", errno);
+			break;
+		}
+		/*
+		struct sockaddr_in source_addr;
+		socklen_t socklen = sizeof(source_addr);
+		int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, (struct sockaddr *)&source_addr, &socklen);
+		if( len < 0 ){
+			ESP_LOGE(TAG, "recvfrom failed: errno %d", errno);
+			break;
+		}else{
+			rx_buffer[len] = 0;
+			ESP_LOGI(TAG, "RX:%s", rx_buffer);
+		}
+		*/
+		// 
+		xSemaphoreGive(xBinSemaphore);
+		vTaskDelay(1);
+	}
+    vTaskDelete(NULL);
+}
+
 static void imu_task()
 {
-    const uint64_t interval = 10;
-    mpu9250_data_t d = {0};
-    uint64_t t0=0, t1;
-    float q[4];
-    float v[3];
-    //
+	const uint64_t interval = 10;
+	mpu9250_data_t d = {0};
+	uint64_t t0=0, t1;
+	float q[4];
+	float v[3];
+	//
 	vTaskDelay(100/portTICK_PERIOD_MS);
-    mpu9250_init();
-    enableDoFScan = true;
-    // 
-    while(1){
-        t1 = xTaskGetTickCount() / portTICK_PERIOD_MS;
-        if( enableDoFScan && t1-t0 > interval ){
-            t0 = t1 - interval;
-            mpu9250_read_acc(&d);
-            mpu9250_read_cmp(&d);
-            madgwick_filterIMU2(0.01f,d.gyr_x,d.gyr_y,d.gyr_z,d.acc_x,d.acc_y,d.acc_z);
-            //madgwick_filterAHRS(0.01f,d.gyr_x,d.gyr_y,d.gyr_z,d.acc_x,d.acc_y,d.acc_z,d.cmp_x,d.cmp_y,d.cmp_z);
-            read_quaternion(q);
-            read_eulerAngle(v);
-            //ESP_LOGI(TAG,"%llu,%.3f,%.3f,%.3f,%.3f",t1,q[0],q[1],q[2],q[3]);
-            //ESP_LOGI(TAG,"%.3f,%.3f,%.3f",v[0],v[1],v[2]);
-            printf("%.3f,%.3f,%.3f,%.3f\n",q[0],q[1],q[2],q[3]);
-            //printf("%.3f,%.3f,%.3f\n",v[0],v[1],v[2]);
-            //
-            //printf("%f,%f,%f,%f,%f,%f\n",d.acc_x,d.acc_y,d.acc_z,d.gyr_x,d.gyr_y,d.gyr_z);
-        }
-        vTaskDelay(1/portTICK_PERIOD_MS);
-    } 
+	mpu9250_init();
+	enableDoFScan = false;
+	gyro_error_rs = 5.0f;
+	gyro_error_rss = 0.2f;
+	enableDoFScan = true;
+	useAHRS = true;
+	// 
+	while(1){
+		t1 = xTaskGetTickCount() / portTICK_PERIOD_MS;
+		if( enableDoFScan && t1-t0 > interval ){
+			BaseType_t xStatus = xSemaphoreTake(xBinSemaphore,1000U);
+			t0 = t1 - interval;
+			mpu9250_read_acc(&d);
+			mpu9250_read_cmp(&d);
+			if( useAHRS ){
+				madgwick_filterIMU2(0.01f,d.gyr_x,d.gyr_y,d.gyr_z,d.acc_x,d.acc_y,d.acc_z);
+			}else{
+				madgwick_filterAHRS(0.01f,d.gyr_x,d.gyr_y,d.gyr_z,d.acc_x,d.acc_y,d.acc_z,d.cmp_x,d.cmp_y,d.cmp_z);
+			}
+			read_quaternion(q);
+			read_eulerAngle(v);
+			xSemaphoreGive(xBinSemaphore);
+		}
+		vTaskDelay(1/portTICK_PERIOD_MS);
+	} 
 }
 
 
 static void main_task()
 {
-    while(1){
-        int c = getchar();
-        switch(c){
-            case '0':
-                ESP_LOGI(TAG,"smart_config_start");
-                smart_config_start();
-                break;
-            case '1':
-                ESP_LOGI(TAG,"wifi_connect");
-                wifi_connect();
-                break;
-            case '2':
-                ESP_LOGI(TAG,"wifi_disconnect");
-                wifi_disconnect();
-                break;
-            case '3':
-                ESP_LOGI(TAG,"mpu9250_init");
-                mpu9250_init();
-                break;
-            case '4':
-                for( int i=0; i<10; i++ ){
-                    mpu9250_data_t d = {0};
-                    mpu9250_read_acc(&d);
-                    mpu9250_read_cmp(&d);
-                    //
-                    ESP_LOGI(TAG,"%f,%f,%f, %f,%f,%f, %f,%f,%f, %f",
-                        d.acc_x,d.acc_y,d.acc_z,
-                        d.gyr_x,d.gyr_y,d.gyr_z,
-                        d.cmp_x,d.cmp_y,d.cmp_z,
-                        d.temp
-                        );
-                    // 
-                    vTaskDelay(1/portTICK_PERIOD_MS);
-                }
-                break;
-            case '5':
-                ak8963_selftest();
-                break;
-            case '6':
-                enableDoFScan = !enableDoFScan;                
-                break;
-            default:
-                break;
-        }
-        // 
-
-
-        //
-        vTaskDelay(1);
-    }
+	char buf[NVS_DATA_SIZE_MAX] = {0};
+	char cmd[NVS_DATA_SIZE_MAX] = {0};
+	char key[NVS_DATA_SIZE_MAX] = {0};
+	char val[NVS_DATA_SIZE_MAX] = {0};
+	// 
+	while(1){
+		int c = getchar();
+		//
+		if( c == '\n' ){
+			memset(cmd,0,sizeof(cmd));
+			memset(key,0,sizeof(key));
+			memset(val,0,sizeof(val));
+			sscanf(buf,"%s %s %s",cmd,key,val);
+			memset(buf,0,sizeof(buf));
+			//
+			putchar(c);		// ECHO
+			//
+			if( strcmp(cmd,"get") == 0 && strlen(key) > 0 ){
+				nvs_get_str_ex(key,val);
+			}else if( strcmp(cmd,"set") == 0 && strlen(key) > 0 ){
+				nvs_set_str_ex(key,val);
+			}else if( strcmp(cmd,"del") == 0 && strlen(key) > 0 ){
+				nvs_erase_key_ex(key);
+			}else if( strcmp(cmd,"info") == 0 ){
+				tcpip_adapter_ip_info_t ipInfo; 
+				tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ipInfo);
+				printf("My IP: " IPSTR "\n", IP2STR(&ipInfo.ip));
+			}else if( strcmp(cmd,"imu") == 0 ){
+				enableDoFScan = ( strcmp(key,"0") == 0 ) ? false : true;
+			}else if( strcmp(cmd,"mode") == 0 ){
+				useAHRS = ( strcmp(key,"0") == 0 ) ? false : true;
+			}else if( strcmp(cmd,"rss") == 0 ){
+				gyro_error_rs = atoff(key);
+				gyro_error_rss = atoff(val);
+			}
+		}else if( c == '\b' ){
+			if( strlen(buf) > 0 ){
+				buf[strlen(buf)-1] = '\0';
+				putchar(c);		// ECHO
+			}
+		}else if( strlen(buf) >= NVS_DATA_SIZE_MAX-1 ){
+			
+		}else if( c == '\r' ){
+			
+		}else if( c > 0 ){
+			char cs[2] = { (char)c, '\0' };
+			strcat(buf,cs);
+			putchar(c);		// ECHO
+		}
+		//
+		vTaskDelay(1);
+	}
 }
 
 void app_main()
 {
-    // init
-    ESP_ERROR_CHECK( nvs_flash_init() );
-    tcpip_adapter_init();
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    // 
-    xTaskCreate(led_task,"led_task",1024*1,NULL,configMAX_PRIORITIES,&led_task_handle);
-    xTaskCreate(imu_task,"imu_task",1024*2,NULL,configMAX_PRIORITIES,&imu_task_handle);
-    xTaskCreate(main_task,"main_task",1024*2,NULL,configMAX_PRIORITIES,NULL);
+	nvs_init();
+	tcpip_adapter_init();
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	{
+		char ssid[NVS_DATA_SIZE_MAX] = {0};
+		char password[NVS_DATA_SIZE_MAX] = {0};
+		//
+		if( nvs_get_str_ex("ssid",ssid) == ESP_OK ){
+			printf("ssid: %s\n",ssid);
+			strcpy((char*)(wifi_config.sta.ssid),ssid);
+		}
+		if( nvs_get_str_ex("password",password) == ESP_OK ){
+			printf("password: %s\n",password);
+			strcpy((char*)(wifi_config.sta.password),password);
+		}
+		if( strlen((char*)(wifi_config.sta.ssid)) > 0 && strlen((char*)wifi_config.sta.password) > 0 ){
+			wifi_connect();
+		}
+	}
+	// 
+	xBinSemaphore = xSemaphoreCreateBinary();
+	//
+	xTaskCreate(led_task,"led_task",1024*1,NULL,configMAX_PRIORITIES,&led_task_handle);
+	xTaskCreate(imu_task,"imu_task",1024*2,NULL,configMAX_PRIORITIES,&imu_task_handle);
+	xTaskCreate(udp_task,"udp_task",1024*10,NULL,configMAX_PRIORITIES,&udp_task_handle);
+	xTaskCreate(main_task,"main_task",1024*2,NULL,configMAX_PRIORITIES,NULL);
 }
